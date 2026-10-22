@@ -1,0 +1,2053 @@
+openapi: 3.1.0
+info:
+  title: Lattice interview API
+  version: 1.0.0
+  summary: Backend contract for the Lattice system-design interview client.
+  description: |
+    This is the HTTP and WebSocket API behind `InterviewService` (`src/services/api.ts`).
+    The UI calls that interface only. Paths below are the server operations that interface requires.
+
+    Two calls are not server endpoints:
+
+    - `setActorMode` chooses which browser credential later calls use. Send it as the `X-Lattice-Actor` header.
+    - `subscribe` refreshes the dashboard when the in-memory store changes. It is not a poll or a socket.
+
+    `getGuestLinkPath` is not a server endpoint either. `POST /v1/sessions/{sessionId}/guest-links` returns the raw token once. The client stores it locally. The server stores only a SHA-256 hash and must not return the token again.
+
+    Timestamps are ISO-8601 UTC strings unless a field says otherwise. Ids are opaque strings. Guest-link tokens and magic-link tokens are 32 bytes, encoded as 64 hex characters (256 bits).
+
+    ## Authentication
+
+    | Scheme | Cookie | Set by | Used for |
+    | --- | --- | --- | --- |
+    | Interviewer session | `lattice_session` | `POST /v1/auth/magic-links/complete` | Signed-in interviewer calls |
+    | Guest session | `lattice_guest` | `POST /v1/join/{token}` | Guest calls for that interview. Expires after 2 hours |
+
+    Cookies are `HttpOnly`, `Secure`, `SameSite=Lax`, and `Path=/`. Send `X-Lattice-Actor: guest` to use the guest cookie when both cookies exist. The default is `user`.
+
+    `GET /v1/me` returns `null` when the interviewer cookie is missing. It does not return 401.
+
+    Failed calls use the `Error` schema. `code` is the value the client branches on. `status` matches the HTTP status.
+
+    | HTTP | `code` values |
+    | --- | --- |
+    | 400 | `invalid`, `expired` (magic link only) |
+    | 401 | `unauthorized` |
+    | 403 | `forbidden`, `ended`, `archived`, `revoked`, `removed`, `locked`, `capacity`, `expired` (guest link) |
+    | 404 | `not_found` |
+    | 409 | `conflict` |
+    | 429 | `rate_limited` |
+
+servers:
+  - url: /
+    description: Same origin as the Lattice web app
+
+tags:
+  - name: Auth
+    description: Interviewer magic-link sign-in
+  - name: Sessions
+    description: Dashboard and interview lifecycle
+  - name: Sharing
+    description: Guest links, email invites, and participants
+  - name: Canvas
+    description: Document read, export, clear, and restore
+  - name: Collaboration
+    description: WebSocket room for operations and presence
+  - name: Join
+    description: Public guest-link preview and join
+
+paths:
+  /v1/auth/magic-links:
+    post:
+      tags: [Auth]
+      operationId: requestMagicLink
+      summary: Email a sign-in link
+      description: |
+        Public. Rate limit is 5 requests per email per 10 minutes.
+        The client requires `verificationPath` in the response so the demo can open the link.
+        The server stores only `sha256(token)`. The link expires after 15 minutes and is single-use.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MagicLinkRequest'
+      responses:
+        '200':
+          description: Magic link created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MagicLinkResponse'
+        '400':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+
+  /v1/auth/magic-links/complete:
+    post:
+      tags: [Auth]
+      operationId: completeMagicLink
+      summary: Redeem a magic link
+      description: |
+        Public. Marks the link used, creates the user on first sign-in, and claims email invites for that address.
+        Sets the `lattice_session` cookie. The same client may retry a just-redeemed link and still receive the user.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteMagicLinkRequest'
+      responses:
+        '200':
+          description: Signed in
+          headers:
+            Set-Cookie:
+              description: '`lattice_session` interviewer session'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: '`invalid` if the link was already used, or `expired` if it is older than 15 minutes'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Read the signed-in interviewer
+      description: |
+        Authentication optional. Returns the user for `lattice_session`, or `null` when that cookie is absent.
+        Does not look at the guest cookie.
+      security:
+        - {}
+        - interviewerSession: []
+      responses:
+        '200':
+          description: Current interviewer, or null
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/User'
+                  - type: 'null'
+
+  /v1/auth/sign-out:
+    post:
+      tags: [Auth]
+      operationId: signOut
+      summary: Clear the interviewer session
+      description: Requires the interviewer session. Clears `lattice_session`. Does not clear `lattice_guest`.
+      security:
+        - interviewerSession: []
+      responses:
+        '204':
+          description: Signed out
+          headers:
+            Set-Cookie:
+              description: '`lattice_session` cleared'
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions:
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: List interviews for the signed-in user
+      description: Requires the interviewer session. Returns sessions the user owns or was invited to, newest update first.
+      security:
+        - interviewerSession: []
+      responses:
+        '200':
+          description: Session list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionListItem'
+        '401':
+          $ref: '#/components/responses/Error'
+    post:
+      tags: [Sessions]
+      operationId: createSession
+      summary: Create a draft interview
+      description: |
+        Requires the interviewer session. Rate limit is 30 creates per user per hour.
+        The caller becomes the owner and an active participant. `maxParticipants` defaults to 10.
+        `initialDocument` is stored as the canvas at epoch 0 when omitted, or as the given document when present.
+      security:
+        - interviewerSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionInput'
+      responses:
+        '201':
+          description: Draft created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}:
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: Read one interview
+      description: |
+        Interviewer session or guest session. The guest must belong to this `sessionId`.
+        Candidates receive 403 `ended` or `archived` when the interview is closed.
+        `links[].hasLocalToken` is always false from the server. The client sets it when this browser stored the raw token.
+      security:
+        - interviewerSession: []
+        - guestSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/ActorMode'
+      responses:
+        '200':
+          description: Session detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+    patch:
+      tags: [Sessions]
+      operationId: updateSession
+      summary: Update title, prompt, schedule, duration, or capacity
+      description: |
+        Requires the interviewer session. Owner only. Rejected when the interview is ended or archived.
+        After a successful update the collaboration room receives `canvas_replaced` with the same document and the new session.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSessionInput'
+      responses:
+        '200':
+          description: Updated session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/start:
+    post:
+      tags: [Sessions]
+      operationId: startSession
+      summary: Start a draft interview
+      description: |
+        Requires the interviewer session. Owner only. Only a `draft` can start.
+        Sets `state` to `live` and `startedAt` to now. Calling it again while already live returns the session unchanged.
+        The room receives `canvas_replaced` so other participants see the running timer.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Live session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/end:
+    post:
+      tags: [Sessions]
+      operationId: endSession
+      summary: End an interview
+      description: |
+        Requires the interviewer session. Owner only.
+        Writes a snapshot, sets `state` to `ended`, sets `endedAt`, and sets `candidateEditingEnabled` to false.
+        The room receives `session_ended`.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Ended session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/archive:
+    post:
+      tags: [Sessions]
+      operationId: archiveSession
+      summary: Archive an interview
+      description: |
+        Requires the interviewer session. Owner only.
+        A draft or live interview is snapshotted first. `state` becomes `archived` and candidate editing is turned off.
+        The room receives `session_ended`. Archiving an already archived session returns it unchanged.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Archived session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/duplicate:
+    post:
+      tags: [Sessions]
+      operationId: duplicateSession
+      summary: Duplicate an interview as a new draft
+      description: |
+        Requires the interviewer session. Owner only.
+        The copy is a draft owned by the caller, with the same title, prompt, duration, and canvas document. Guest links are not copied.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '201':
+          description: New draft
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/guest-links:
+    post:
+      tags: [Sharing]
+      operationId: createGuestLink
+      summary: Create or rotate a guest link
+      description: |
+        Requires the interviewer session. Owner only.
+        Revokes any other active link with the same `roleGranted` for this session. Does not disconnect people already inside.
+        Ended and archived interviews respond with 403 `archived`.
+        `token` and `path` are returned only in this response. The server stores `sha256(token)`.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateLinkInput'
+      responses:
+        '201':
+          description: Link issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssuedLink'
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/guest-links/{linkId}:
+    delete:
+      tags: [Sharing]
+      operationId: revokeGuestLink
+      summary: Revoke a guest link
+      description: |
+        Requires the interviewer session. Owner only.
+        New joins fail. Participants already in the room stay connected.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/LinkId'
+      responses:
+        '204':
+          description: Revoked
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/invites:
+    post:
+      tags: [Sharing]
+      operationId: inviteByEmail
+      summary: Invite an interviewer or observer by email
+      description: |
+        Requires the interviewer session. Owner only.
+        If that email already has an interviewer session, membership is granted now. Otherwise the invite is claimed by `POST /v1/auth/magic-links/complete`.
+        The owner cannot invite their own email.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteRequest'
+      responses:
+        '204':
+          description: Invite saved
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/participants/{participantId}:
+    delete:
+      tags: [Sharing]
+      operationId: removeParticipant
+      summary: Remove a participant
+      description: |
+        Requires the interviewer session. Owner only. The owner participant cannot be removed.
+        Sets `leftAt`, revokes that participant's collaboration credentials, and sends `participant_removed` to the room.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/ParticipantId'
+      responses:
+        '204':
+          description: Removed
+        '400':
+          $ref: '#/components/responses/Error'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/candidate-editing:
+    put:
+      tags: [Sharing]
+      operationId: setCandidateEditing
+      summary: Lock or unlock candidate editing
+      description: |
+        Requires the interviewer session. Owner only. Rejected when the interview is ended or archived.
+        The room receives `permission_changed`.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [enabled]
+              properties:
+                enabled:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/cursor-visibility:
+    put:
+      tags: [Sharing]
+      operationId: setCursorVisibility
+      summary: Show or hide collaborator cursors
+      description: |
+        Requires the interviewer session. Owner only.
+        The room receives `permission_changed`.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [visible]
+              properties:
+                visible:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/audit:
+    get:
+      tags: [Sessions]
+      operationId: listAuditEvents
+      summary: List activity for an interview
+      description: |
+        Requires the interviewer session. Owner and interviewer roles only. Observers, candidates, and guests receive 403 `forbidden`.
+        Newest event first.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Audit events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AuditEvent'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/canvas:
+    get:
+      tags: [Canvas]
+      operationId: getCanvas
+      summary: Read the canvas document
+      description: |
+        Interviewer session or guest session. Same view rules as `GET /v1/sessions/{sessionId}`.
+        Does not include a collaboration credential. Open the WebSocket to edit.
+      security:
+        - interviewerSession: []
+        - guestSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/ActorMode'
+      responses:
+        '200':
+          description: Current document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CanvasBundle'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/canvas/clear:
+    post:
+      tags: [Canvas]
+      operationId: clearCanvas
+      summary: Snapshot the canvas and replace it with an empty document
+      description: |
+        Requires the interviewer session. Owner only. Rejected when the interview is ended or archived.
+        Saves a snapshot, increments `epoch`, and broadcasts a restore `document_update` for the empty document.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Snapshot of the previous canvas
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [snapshotId]
+                properties:
+                  snapshotId:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/snapshots/{snapshotId}/restore:
+    post:
+      tags: [Canvas]
+      operationId: restoreSnapshot
+      summary: Restore a canvas snapshot
+      description: |
+        Requires the interviewer session. Owner only. Rejected when the interview is ended or archived.
+        Loads the snapshot into a new `epoch` and broadcasts the restore. No response body.
+      security:
+        - interviewerSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/SnapshotId'
+      responses:
+        '204':
+          description: Restored
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/export:
+    get:
+      tags: [Canvas]
+      operationId: exportCanvas
+      summary: Download the canvas as JSON
+      description: |
+        Interviewer session or guest session. Candidates receive 403 `forbidden`.
+        Owner, interviewer, and observer may export, including after the interview ends.
+        The client saves the response body as the download file.
+      security:
+        - interviewerSession: []
+        - guestSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/ActorMode'
+      responses:
+        '200':
+          description: Export document
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CanvasExport'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/join/{token}:
+    get:
+      tags: [Join]
+      operationId: previewJoin
+      summary: Preview a guest link
+      description: |
+        Public. Does not return the prompt or the canvas.
+        Counts toward the join rate limit of 30 attempts per token per minute.
+        A second call from `POST /v1/join/{token}` also counts.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/GuestToken'
+      responses:
+        '200':
+          description: Lobby preview
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JoinPreview'
+        '403':
+          description: '`revoked`, `expired`, `ended`, `archived`, or `capacity`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+    post:
+      tags: [Join]
+      operationId: joinWithToken
+      summary: Join through a guest link
+      description: |
+        Public. Requires `acceptPrivacy: true` and a display name of 1 to 40 characters.
+        Increments the link's `useCount`, creates a participant, and sets `lattice_guest` to a new collaboration credential.
+        The credential expires after 2 hours. The JSON body does not include it.
+        The prompt is included only in this response, not in the preview.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/GuestToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JoinRequest'
+      responses:
+        '200':
+          description: Joined
+          headers:
+            Set-Cookie:
+              description: '`lattice_guest` collaboration credential. Max-Age is 7200 seconds.'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JoinResult'
+        '400':
+          $ref: '#/components/responses/Error'
+        '403':
+          description: '`revoked`, `expired`, `ended`, `archived`, or `capacity`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '429':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/guest:
+    post:
+      tags: [Join]
+      operationId: restoreGuest
+      summary: Resume a guest session
+      description: |
+        Requires the guest session. Returns `null` when the cookie is missing or belongs to a different interview.
+        Returns 401 `unauthorized` when the credential is expired or revoked.
+        Candidates cannot restore an ended or archived interview.
+      security:
+        - guestSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Restored guest, or null
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/JoinResult'
+                  - type: 'null'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+
+  /v1/sessions/{sessionId}/collaboration:
+    get:
+      tags: [Collaboration]
+      operationId: connect
+      summary: Open the collaboration WebSocket
+      description: |
+        Interviewer session or guest session. Upgrade this GET to a WebSocket (`wss` on the same path).
+
+        The server checks view permission, ensures the caller has a participant row, and then sends `room_joined`.
+        For an interviewer who does not already have a guest credential, the server mints a 2-hour collaboration credential and binds it to the socket. The browser keeps using its cookie. The credential is not a response field.
+
+        Client frames are JSON `ClientMessage` values. Server frames are JSON `ServerEvent` values.
+        `document_update` from the client is acknowledged by the broadcast `document_update` echo. The connection resolves `sendDocumentUpdate` as `{ "cursor": <n>, "queued": false }`. `queued: true` is only a local offline buffer and is never sent by the server.
+        A failed edit is a `rejected` frame to that socket only. The in-flight send fails with the same `code`, `message`, and `document`.
+        `presence_update` and `ping` have no separate ack. `ping` is answered with `pong`.
+        Closing the socket drops presence and sends `presence_left`.
+
+        Edits are limited to 600 accepted operations per participant per minute, and each operation payload must be at most 500 KB.
+        A patch for a different `epoch` than the stored document is 409 `conflict` and does not change the document.
+        Duplicate `clientOperationId` values are ignored and return the original cursor.
+      security:
+        - interviewerSession: []
+        - guestSession: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/ActorMode'
+      responses:
+        '101':
+          description: |
+            Switching Protocols. The HTTP response has no body.
+            After the upgrade, client text frames are `ClientMessage` and server text frames are `ServerEvent`.
+          headers:
+            Upgrade:
+              schema:
+                type: string
+                enum: [websocket]
+          content:
+            application/json:
+              schema:
+                description: WebSocket text frames exchanged after the upgrade, not the HTTP upgrade body.
+                oneOf:
+                  - $ref: '#/components/schemas/ClientMessage'
+                  - $ref: '#/components/schemas/ServerEvent'
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+
+components:
+  securitySchemes:
+    interviewerSession:
+      type: apiKey
+      in: cookie
+      name: lattice_session
+      description: Interviewer session set by redeeming a magic link.
+    guestSession:
+      type: apiKey
+      in: cookie
+      name: lattice_guest
+      description: Guest collaboration credential set by joining a guest link. Expires after 2 hours.
+
+  parameters:
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+    LinkId:
+      name: linkId
+      in: path
+      required: true
+      schema:
+        type: string
+    ParticipantId:
+      name: participantId
+      in: path
+      required: true
+      schema:
+        type: string
+    SnapshotId:
+      name: snapshotId
+      in: path
+      required: true
+      schema:
+        type: string
+    GuestToken:
+      name: token
+      in: path
+      required: true
+      description: Raw guest-link token. 64 hex characters. Do not log it.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
+    ActorMode:
+      name: X-Lattice-Actor
+      in: header
+      required: false
+      description: |
+        Which credential to use when both cookies are present. `user` is the default and reads `lattice_session`.
+        `guest` reads `lattice_guest`. This is the wire form of `setActorMode`.
+      schema:
+        type: string
+        enum: [user, guest]
+        default: user
+
+  responses:
+    Error:
+      description: Request failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid
+            - not_found
+            - expired
+            - unauthorized
+            - forbidden
+            - ended
+            - archived
+            - revoked
+            - removed
+            - locked
+            - conflict
+            - capacity
+            - too_large
+            - rate_limited
+        message:
+          type: string
+
+    MagicLinkRequest:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          description: Trimmed and lower-cased. Must contain a dot in the domain.
+
+    MagicLinkResponse:
+      type: object
+      additionalProperties: false
+      required: [verificationPath]
+      properties:
+        verificationPath:
+          type: string
+          description: App path `/auth/verify?token=` plus the raw magic-link token.
+          examples:
+            - /auth/verify?token=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+    CompleteMagicLinkRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, email, displayName, organizationId, createdAt]
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+          format: email
+        displayName:
+          type: string
+        organizationId:
+          type: [string, 'null']
+        createdAt:
+          type: string
+          format: date-time
+
+    SessionState:
+      type: string
+      enum: [draft, live, ended, archived]
+
+    Role:
+      type: string
+      enum: [owner, interviewer, candidate, observer]
+
+    GuestRole:
+      type: string
+      enum: [candidate, observer]
+
+    MembershipRole:
+      type: string
+      enum: [owner, interviewer, observer]
+
+    Session:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - ownerUserId
+        - title
+        - prompt
+        - state
+        - candidateEditingEnabled
+        - cursorVisibility
+        - durationMinutes
+        - scheduledAt
+        - startedAt
+        - endedAt
+        - createdAt
+        - updatedAt
+        - maxParticipants
+      properties:
+        id:
+          type: string
+        ownerUserId:
+          type: string
+        title:
+          type: string
+          maxLength: 200
+        prompt:
+          type: string
+          maxLength: 10000
+        state:
+          $ref: '#/components/schemas/SessionState'
+        candidateEditingEnabled:
+          type: boolean
+        cursorVisibility:
+          type: boolean
+        durationMinutes:
+          type: [integer, 'null']
+          minimum: 5
+          maximum: 240
+          description: Null means no timer limit. Zero is stored as null.
+        scheduledAt:
+          type: [string, 'null']
+          format: date-time
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        endedAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        maxParticipants:
+          type: integer
+          minimum: 2
+          maximum: 10
+
+    SessionListItem:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - title
+        - state
+        - createdAt
+        - updatedAt
+        - scheduledAt
+        - startedAt
+        - endedAt
+        - participantNames
+        - role
+        - hasActiveGuestLink
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        state:
+          $ref: '#/components/schemas/SessionState'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        scheduledAt:
+          type: [string, 'null']
+          format: date-time
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+        endedAt:
+          type: [string, 'null']
+          format: date-time
+        participantNames:
+          type: array
+          items:
+            type: string
+          description: Display names of participants who have not left.
+        role:
+          $ref: '#/components/schemas/MembershipRole'
+        hasActiveGuestLink:
+          type: boolean
+          description: True when a non-revoked candidate guest link exists.
+
+    Participant:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - sessionId
+        - userId
+        - guestLinkId
+        - displayName
+        - role
+        - color
+        - joinedAt
+        - leftAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+        sessionId:
+          type: string
+        userId:
+          type: [string, 'null']
+        guestLinkId:
+          type: [string, 'null']
+        displayName:
+          type: string
+          maxLength: 40
+        role:
+          $ref: '#/components/schemas/Role'
+        color:
+          type: string
+        joinedAt:
+          type: string
+          format: date-time
+        leftAt:
+          type: [string, 'null']
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    GuestLinkPublic:
+      type: object
+      additionalProperties: false
+      required: [id, roleGranted, expiresAt, maxUses, useCount, revokedAt, createdAt, hasLocalToken]
+      properties:
+        id:
+          type: string
+        roleGranted:
+          $ref: '#/components/schemas/GuestRole'
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+        maxUses:
+          type: [integer, 'null']
+          minimum: 1
+        useCount:
+          type: integer
+          minimum: 0
+        revokedAt:
+          type: [string, 'null']
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        hasLocalToken:
+          type: boolean
+          description: Server always sends false. The client overwrites it from its local token vault.
+
+    SnapshotInfo:
+      type: object
+      additionalProperties: false
+      required: [id, operationCursor, createdAt, checksum]
+      properties:
+        id:
+          type: string
+        operationCursor:
+          type: integer
+          minimum: 0
+        createdAt:
+          type: string
+          format: date-time
+        checksum:
+          type: string
+          description: SHA-256 hex of the canonical JSON snapshot blob.
+
+    SessionDetail:
+      type: object
+      additionalProperties: false
+      required: [session, participants, myRole, myParticipantId, links, snapshots]
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+        participants:
+          type: array
+          items:
+            $ref: '#/components/schemas/Participant'
+        myRole:
+          $ref: '#/components/schemas/Role'
+        myParticipantId:
+          type: string
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/GuestLinkPublic'
+        snapshots:
+          type: array
+          items:
+            $ref: '#/components/schemas/SnapshotInfo'
+
+    CreateSessionInput:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        prompt:
+          type: string
+          maxLength: 10000
+        scheduledAt:
+          type: [string, 'null']
+          format: date-time
+        durationMinutes:
+          type: [integer, 'null']
+          minimum: 5
+          maximum: 240
+        initialDocument:
+          $ref: '#/components/schemas/DocState'
+
+    UpdateSessionInput:
+      type: object
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+        prompt:
+          type: string
+          maxLength: 10000
+        scheduledAt:
+          type: [string, 'null']
+          format: date-time
+        durationMinutes:
+          type: [integer, 'null']
+          minimum: 5
+          maximum: 240
+        maxParticipants:
+          type: integer
+          minimum: 2
+          maximum: 10
+
+    CreateLinkInput:
+      type: object
+      additionalProperties: false
+      properties:
+        roleGranted:
+          $ref: '#/components/schemas/GuestRole'
+          default: candidate
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+        maxUses:
+          type: [integer, 'null']
+          minimum: 1
+
+    IssuedLink:
+      type: object
+      additionalProperties: false
+      required: [id, sessionId, roleGranted, expiresAt, maxUses, createdAt, token, path]
+      properties:
+        id:
+          type: string
+        sessionId:
+          type: string
+        roleGranted:
+          $ref: '#/components/schemas/GuestRole'
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+        maxUses:
+          type: [integer, 'null']
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+        token:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Raw token. Returned once.
+        path:
+          type: string
+          description: App path `/join/` plus the raw token.
+          examples:
+            - /join/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+    InviteRequest:
+      type: object
+      additionalProperties: false
+      required: [email, role]
+      properties:
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [interviewer, observer]
+
+    JoinPreview:
+      type: object
+      additionalProperties: false
+      required: [sessionId, title, state]
+      properties:
+        sessionId:
+          type: string
+        title:
+          type: string
+        state:
+          $ref: '#/components/schemas/SessionState'
+
+    JoinRequest:
+      type: object
+      additionalProperties: false
+      required: [displayName, acceptPrivacy]
+      properties:
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 40
+        acceptPrivacy:
+          type: boolean
+          description: Must be true.
+
+    JoinResult:
+      type: object
+      additionalProperties: false
+      required:
+        - sessionId
+        - title
+        - prompt
+        - state
+        - participant
+        - candidateEditingEnabled
+        - cursorVisibility
+        - durationMinutes
+        - startedAt
+      properties:
+        sessionId:
+          type: string
+        title:
+          type: string
+        prompt:
+          type: string
+        state:
+          $ref: '#/components/schemas/SessionState'
+        participant:
+          $ref: '#/components/schemas/Participant'
+        candidateEditingEnabled:
+          type: boolean
+        cursorVisibility:
+          type: boolean
+        durationMinutes:
+          type: [integer, 'null']
+        startedAt:
+          type: [string, 'null']
+          format: date-time
+
+    CanvasBundle:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, cursor, epoch, document]
+      properties:
+        schemaVersion:
+          type: integer
+          const: 1
+        cursor:
+          type: integer
+          minimum: 0
+          description: Monotonic server operation cursor.
+        epoch:
+          type: integer
+          minimum: 0
+          description: Incremented by clear and restore. Patches for an older epoch are rejected.
+        document:
+          $ref: '#/components/schemas/DocState'
+
+    CanvasExport:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, sessionId, title, exportedAt, document]
+      properties:
+        schemaVersion:
+          type: integer
+          const: 1
+        sessionId:
+          type: string
+        title:
+          type: string
+        exportedAt:
+          type: string
+          format: date-time
+        document:
+          $ref: '#/components/schemas/DocState'
+
+    AuditEvent:
+      type: object
+      additionalProperties: false
+      required: [id, sessionId, actorId, type, at, detail]
+      properties:
+        id:
+          type: string
+        sessionId:
+          type: string
+        actorId:
+          type: string
+        type:
+          type: string
+          description: |
+            Known values: `session_created`, `session_started`, `session_ended`, `session_archived`,
+            `session_duplicated`, `canvas_cleared`, `snapshot_restored`, `link_created`, `link_revoked`,
+            `invite_sent`, `participant_removed`, `permission_changed`.
+        at:
+          type: string
+          format: date-time
+        detail:
+          type: string
+
+    Point:
+      type: object
+      additionalProperties: false
+      required: [x, y]
+      properties:
+        x:
+          type: number
+        y:
+          type: number
+
+    Clock:
+      type: object
+      additionalProperties: false
+      required: [t, a]
+      properties:
+        t:
+          type: number
+          description: Logical time in milliseconds.
+        a:
+          type: string
+          description: Actor id. Ordering is `t`, then `a`.
+
+    BooleanRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: boolean
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    NumberRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: number
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    StringRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: string
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    NullableStringRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: [string, 'null']
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    ComponentTypeRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          $ref: '#/components/schemas/ComponentType'
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    AnchorRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: string
+          enum: [top, right, bottom, left, auto]
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    RouteRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: string
+          enum: [straight, elbow, curved]
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    StrokeToolRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: string
+          enum: [pen, highlighter]
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    ConnectorWidthRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: integer
+          enum: [1, 2, 3]
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    PointsRegister:
+      type: object
+      additionalProperties: false
+      required: [v, c]
+      properties:
+        v:
+          type: array
+          items:
+            $ref: '#/components/schemas/Point'
+        c:
+          $ref: '#/components/schemas/Clock'
+
+    ComponentType:
+      type: string
+      enum:
+        - service
+        - rounded
+        - text
+        - sticky
+        - boundary
+        - icon
+        - rect
+        - ellipse
+        - sql
+        - nosql
+        - cache
+        - object-storage
+        - warehouse
+        - queue
+        - stream
+        - pubsub
+        - client
+        - browser
+        - gateway
+        - load-balancer
+        - cdn
+        - external-api
+        - server
+        - worker
+        - function
+        - container
+        - llm
+        - embedding
+        - vector-db
+        - agent
+
+    ElementState:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id:
+          type: string
+        createdBy:
+          type: string
+        tomb:
+          $ref: '#/components/schemas/BooleanRegister'
+        type:
+          $ref: '#/components/schemas/ComponentTypeRegister'
+        x:
+          $ref: '#/components/schemas/NumberRegister'
+        y:
+          $ref: '#/components/schemas/NumberRegister'
+        width:
+          $ref: '#/components/schemas/NumberRegister'
+        height:
+          $ref: '#/components/schemas/NumberRegister'
+        label:
+          $ref: '#/components/schemas/StringRegister'
+        description:
+          $ref: '#/components/schemas/StringRegister'
+        fill:
+          $ref: '#/components/schemas/NullableStringRegister'
+        z:
+          $ref: '#/components/schemas/NumberRegister'
+        parentId:
+          $ref: '#/components/schemas/NullableStringRegister'
+
+    ConnectorState:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id:
+          type: string
+        createdBy:
+          type: string
+        tomb:
+          $ref: '#/components/schemas/BooleanRegister'
+        fromId:
+          $ref: '#/components/schemas/StringRegister'
+        toId:
+          $ref: '#/components/schemas/StringRegister'
+        fromAnchor:
+          $ref: '#/components/schemas/AnchorRegister'
+        toAnchor:
+          $ref: '#/components/schemas/AnchorRegister'
+        route:
+          $ref: '#/components/schemas/RouteRegister'
+        arrowStart:
+          $ref: '#/components/schemas/BooleanRegister'
+        arrowEnd:
+          $ref: '#/components/schemas/BooleanRegister'
+        dashed:
+          $ref: '#/components/schemas/BooleanRegister'
+        color:
+          $ref: '#/components/schemas/StringRegister'
+        width:
+          $ref: '#/components/schemas/ConnectorWidthRegister'
+        label:
+          $ref: '#/components/schemas/StringRegister'
+
+    StrokeState:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id:
+          type: string
+        createdBy:
+          type: string
+        tomb:
+          $ref: '#/components/schemas/BooleanRegister'
+        tool:
+          $ref: '#/components/schemas/StrokeToolRegister'
+        color:
+          $ref: '#/components/schemas/StringRegister'
+        width:
+          $ref: '#/components/schemas/NumberRegister'
+        opacity:
+          $ref: '#/components/schemas/NumberRegister'
+        points:
+          $ref: '#/components/schemas/PointsRegister'
+
+    DocState:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, epoch, elements, connectors, strokes]
+      properties:
+        schemaVersion:
+          type: integer
+          const: 1
+        epoch:
+          type: integer
+          minimum: 0
+        elements:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ElementState'
+        connectors:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ConnectorState'
+        strokes:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/StrokeState'
+
+    PatchOp:
+      type: object
+      additionalProperties: false
+      required: [kind, epoch]
+      properties:
+        kind:
+          type: string
+          const: patch
+        epoch:
+          type: integer
+          minimum: 0
+        elements:
+          type: array
+          items:
+            $ref: '#/components/schemas/ElementState'
+        connectors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConnectorState'
+        strokes:
+          type: array
+          items:
+            $ref: '#/components/schemas/StrokeState'
+
+    RestoreOp:
+      type: object
+      additionalProperties: false
+      required: [kind, epoch, state]
+      properties:
+        kind:
+          type: string
+          const: restore
+        epoch:
+          type: integer
+          minimum: 0
+        state:
+          $ref: '#/components/schemas/DocState'
+
+    CanvasOp:
+      oneOf:
+        - $ref: '#/components/schemas/PatchOp'
+        - $ref: '#/components/schemas/RestoreOp'
+      discriminator:
+        propertyName: kind
+        mapping:
+          patch: '#/components/schemas/PatchOp'
+          restore: '#/components/schemas/RestoreOp'
+
+    ConnectionStatus:
+      type: string
+      enum: [connected, reconnecting, offline]
+
+    Presence:
+      type: object
+      additionalProperties: false
+      required:
+        - participantId
+        - displayName
+        - color
+        - role
+        - connectionState
+        - cursor
+        - selection
+        - laser
+        - lastSeen
+      properties:
+        participantId:
+          type: string
+        displayName:
+          type: string
+        color:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        connectionState:
+          $ref: '#/components/schemas/ConnectionStatus'
+        cursor:
+          oneOf:
+            - $ref: '#/components/schemas/Point'
+            - type: 'null'
+        selection:
+          type: array
+          items:
+            type: string
+        laser:
+          oneOf:
+            - $ref: '#/components/schemas/Point'
+            - type: 'null'
+        lastSeen:
+          type: number
+          description: Unix epoch milliseconds.
+
+    ClientDocumentUpdate:
+      type: object
+      additionalProperties: false
+      required: [type, clientOperationId, op]
+      properties:
+        type:
+          type: string
+          const: document_update
+        clientOperationId:
+          type: string
+        op:
+          $ref: '#/components/schemas/CanvasOp'
+
+    ClientPresenceUpdate:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: presence_update
+        cursor:
+          oneOf:
+            - $ref: '#/components/schemas/Point'
+            - type: 'null'
+        selection:
+          type: array
+          items:
+            type: string
+        laser:
+          oneOf:
+            - $ref: '#/components/schemas/Point'
+            - type: 'null'
+
+    ClientPing:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: ping
+
+    ClientMessage:
+      oneOf:
+        - $ref: '#/components/schemas/ClientDocumentUpdate'
+        - $ref: '#/components/schemas/ClientPresenceUpdate'
+        - $ref: '#/components/schemas/ClientPing'
+      discriminator:
+        propertyName: type
+        mapping:
+          document_update: '#/components/schemas/ClientDocumentUpdate'
+          presence_update: '#/components/schemas/ClientPresenceUpdate'
+          ping: '#/components/schemas/ClientPing'
+
+    RoomJoinedEvent:
+      type: object
+      additionalProperties: false
+      required: [type, document, cursor, epoch, participants, session]
+      properties:
+        type:
+          type: string
+          const: room_joined
+        document:
+          $ref: '#/components/schemas/DocState'
+        cursor:
+          type: integer
+        epoch:
+          type: integer
+        participants:
+          type: array
+          items:
+            $ref: '#/components/schemas/Presence'
+        session:
+          $ref: '#/components/schemas/Session'
+
+    DocumentUpdateEvent:
+      type: object
+      additionalProperties: false
+      required: [type, cursor, actorId, clientOperationId, op]
+      properties:
+        type:
+          type: string
+          const: document_update
+        cursor:
+          type: integer
+        actorId:
+          type: string
+        clientOperationId:
+          type: string
+        op:
+          $ref: '#/components/schemas/CanvasOp'
+
+    CanvasReplacedEvent:
+      type: object
+      additionalProperties: false
+      required: [type, document, cursor, epoch, session]
+      properties:
+        type:
+          type: string
+          const: canvas_replaced
+        document:
+          $ref: '#/components/schemas/DocState'
+        cursor:
+          type: integer
+        epoch:
+          type: integer
+        session:
+          $ref: '#/components/schemas/Session'
+
+    PresenceUpdateEvent:
+      type: object
+      additionalProperties: false
+      required: [type, presence]
+      properties:
+        type:
+          type: string
+          const: presence_update
+        presence:
+          $ref: '#/components/schemas/Presence'
+
+    PresenceLeftEvent:
+      type: object
+      additionalProperties: false
+      required: [type, participantId]
+      properties:
+        type:
+          type: string
+          const: presence_left
+        participantId:
+          type: string
+
+    PermissionChangedEvent:
+      type: object
+      additionalProperties: false
+      required: [type, candidateEditingEnabled, cursorVisibility]
+      properties:
+        type:
+          type: string
+          const: permission_changed
+        candidateEditingEnabled:
+          type: boolean
+        cursorVisibility:
+          type: boolean
+
+    SessionEndedEvent:
+      type: object
+      additionalProperties: false
+      required: [type, session]
+      properties:
+        type:
+          type: string
+          const: session_ended
+        session:
+          $ref: '#/components/schemas/Session'
+
+    ParticipantRemovedEvent:
+      type: object
+      additionalProperties: false
+      required: [type, participantId]
+      properties:
+        type:
+          type: string
+          const: participant_removed
+        participantId:
+          type: string
+
+    RejectedEvent:
+      type: object
+      additionalProperties: false
+      required: [type, code, message, document]
+      properties:
+        type:
+          type: string
+          const: rejected
+        code:
+          type: string
+        message:
+          type: string
+        document:
+          $ref: '#/components/schemas/DocState'
+          description: Server document to keep. The rejected edit is discarded.
+
+    SocketErrorEvent:
+      type: object
+      additionalProperties: false
+      required: [type, code, message]
+      properties:
+        type:
+          type: string
+          const: error
+        code:
+          type: string
+        message:
+          type: string
+
+    PongEvent:
+      type: object
+      additionalProperties: false
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: pong
+
+    ServerEvent:
+      description: JSON text frame from the server.
+      oneOf:
+        - $ref: '#/components/schemas/RoomJoinedEvent'
+        - $ref: '#/components/schemas/DocumentUpdateEvent'
+        - $ref: '#/components/schemas/CanvasReplacedEvent'
+        - $ref: '#/components/schemas/PresenceUpdateEvent'
+        - $ref: '#/components/schemas/PresenceLeftEvent'
+        - $ref: '#/components/schemas/PermissionChangedEvent'
+        - $ref: '#/components/schemas/SessionEndedEvent'
+        - $ref: '#/components/schemas/ParticipantRemovedEvent'
+        - $ref: '#/components/schemas/RejectedEvent'
+        - $ref: '#/components/schemas/SocketErrorEvent'
+        - $ref: '#/components/schemas/PongEvent'
+      discriminator:
+        propertyName: type
+        mapping:
+          room_joined: '#/components/schemas/RoomJoinedEvent'
+          document_update: '#/components/schemas/DocumentUpdateEvent'
+          canvas_replaced: '#/components/schemas/CanvasReplacedEvent'
+          presence_update: '#/components/schemas/PresenceUpdateEvent'
+          presence_left: '#/components/schemas/PresenceLeftEvent'
+          permission_changed: '#/components/schemas/PermissionChangedEvent'
+          session_ended: '#/components/schemas/SessionEndedEvent'
+          participant_removed: '#/components/schemas/ParticipantRemovedEvent'
+          rejected: '#/components/schemas/RejectedEvent'
+          error: '#/components/schemas/SocketErrorEvent'
+          pong: '#/components/schemas/PongEvent'
